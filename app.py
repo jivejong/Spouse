@@ -301,8 +301,7 @@ elif st.session_state.stage == "friend_intervention":
     
     voices = get_voice_mapping(st.session_state.spouse)
     notify_msg = "This app just sent me a notification that you are about to say something really risky to your spouse."
-    autoplay_audio(text_to_speech(notify_msg, voices["friend"]))
-    audio = text_to_speech(st.session_state.friend_speech, voices["friend"])
+    audio = text_to_speech(notify_msg + st.session_state.friend_speech, voices["friend"])
     autoplay_audio(audio)
     
     col1, col2 = st.columns(2)
