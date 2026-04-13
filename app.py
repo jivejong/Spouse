@@ -374,7 +374,7 @@ elif st.session_state.stage == "abort_success":
         st.rerun()
 
 elif st.session_state.stage == "exile":
-    place = "her mother's house" if st.session_state.spouse == "wife" else "the bar"
+    place = "mother's house" if st.session_state.spouse == "wife" else "the bar"
     add_log("System", f"CRITICAL FAILURE", "Spouse has left for {place}")
         
     msg = f"I am going to {place}. Goodbye."
