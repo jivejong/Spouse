@@ -1,14 +1,45 @@
 import streamlit as st
 import os
+import re
 import time
 import json
 import tempfile
 import base64
 import asyncio
+import uuid
 import edge_tts
 import io
 from pathlib import Path
 from groq import Groq
+
+try:
+    from groq import BadRequestError
+except ImportError:  # very old SDs — fall back to a broad catch for the retry
+    BadRequestError = Exception
+
+from telemetry import (
+    init_telemetry,
+    genai_span,
+    record_llm_response,
+    record_tts_audio,
+    app_span,
+)
+
+# ── OpenTelemetry ────────────────────────────────────────────────────────────
+# Idempotent: safe to call on every Streamlit rerun. Exports to the console by
+# default, or to any OTLP backend when OTEL_EXPORTER_OTLP_ENDPOINT is set.
+init_telemetry()
+
+LLM_MODEL = "qwen/qwen3.6-27b"
+STT_MODEL = "whisper-large-v3"
+
+
+def _session_id() -> str:
+    """Stable per-session id used to correlate all spans of one user's run."""
+    if "session_id" not in st.session_state:
+        st.session_state.session_id = uuid.uuid4().hex
+    return st.session_state.session_id
+
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -132,8 +163,17 @@ def text_to_speech(text: str, voice: str) -> bytes:
             if chunk["type"] == "audio":
                 output.write(chunk["data"])
         return output.getvalue()
-    
-    return asyncio.run(_generate())
+
+    with genai_span(
+        "text_to_speech",
+        voice,
+        system="edge-tts",
+        conversation_id=_session_id(),
+        extra_attrs={"tts.text.length": len(text)},
+    ) as span:
+        audio = asyncio.run(_generate())
+        record_tts_audio(span, num_bytes=len(audio), voice=voice)
+        return audio
 
 def get_groq_client():
     api_key = os.environ.get("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY", "")
@@ -148,48 +188,134 @@ def transcribe_audio(audio_bytes: bytes) -> str:
         f.write(audio_bytes)
         tmp_path = f.name
     try:
-        with open(tmp_path, "rb") as f:
-            transcription = client.audio.transcriptions.create(
-                file=("audio.wav", f, "audio/wav"),
-                model="whisper-large-v3",
-                response_format="text",
-            )
-        return transcription.strip()
+        with genai_span(
+            "transcribe",
+            STT_MODEL,
+            conversation_id=_session_id(),
+            extra_attrs={"audio.input.bytes": len(audio_bytes)},
+        ) as span:
+            with open(tmp_path, "rb") as f:
+                transcription = client.audio.transcriptions.create(
+                    file=("audio.wav", f, "audio/wav"),
+                    model=STT_MODEL,
+                    response_format="text",
+                )
+            result = transcription.strip()
+            if span is not None:
+                span.set_attribute("gen_ai.response.text.length", len(result))
+            return result
     finally:
         os.unlink(tmp_path)
 
-def score_idea(idea: str) -> dict:
+def _extract_json(text: str) -> dict:
+    """Robustly pull a JSON object out of an LLM reply.
+
+    Qwen3.6 is a hybrid reasoning model, so the content can be wrapped in
+    ``<think>…</think>`` blocks or code fences. Strip those, then fall back to
+    grabbing the first ``{…}`` object if the whole string isn't clean JSON.
+    """
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    cleaned = cleaned.replace("```json", "").replace("```", "").strip()
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+        if not match:
+            raise
+        return json.loads(match.group(0))
+
+
+def _track_tokens(task: str, resp) -> None:
+    """Record a call's token usage into session state for the sidebar meter.
+
+    Reads the same ``usage`` block the OpenTelemetry spans use, so the in-app
+    counter and the exported metrics stay in sync.
+    """
+    usage = getattr(resp, "usage", None)
+    if usage is None:
+        return
+    inp = getattr(usage, "prompt_tokens", 0) or 0
+    out = getattr(usage, "completion_tokens", 0) or 0
+    st.session_state.setdefault("token_events", [])
+    st.session_state.token_events.insert(0, {
+        "time": time.strftime("%H:%M:%S"),
+        "task": task,
+        "input": inp,
+        "output": out,
+        "total": inp + out,
+    })
+
+
+def _run_chat(prompt: str, *, task: str, temperature: float, reasoning: bool,
+              max_tokens: int, extra_attrs: dict | None = None,
+              response_format: dict | None = None):
+    """Single entry point for every Groq chat call.
+
+    Caps output length and disables the model's thinking
+    (``reasoning_effort="none"``) so Qwen3.6 doesn't burn thinking tokens on
+    tasks that don't need it. Falls back gracefully if the model rejects the
+    reasoning parameter, and records token usage for the sidebar meter.
+    """
     client = get_groq_client()
-    prompt = f"""Evaluate this idea: "{idea}"
-Rate 1-10 (1=Harmless, 10=Catastrophic). 
-Respond ONLY with valid JSON: {{"score": <int>, "reasoning": "<one sentence>"}}"""
-    
-    resp = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+    attrs = {"spousal.task": task, "spousal.reasoning": reasoning}
+    if extra_attrs:
+        attrs.update(extra_attrs)
+
+    kwargs = dict(
+        model=LLM_MODEL,
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.4
+        temperature=temperature,
+        max_completion_tokens=max_tokens,
     )
-    raw = resp.choices[0].message.content.strip().replace("```json", "").replace("```", "").strip()
-    return json.loads(raw)
+    if response_format:
+        kwargs["response_format"] = response_format
+    if not reasoning:
+        kwargs["reasoning_effort"] = "none"
+
+    with genai_span(
+        "chat", LLM_MODEL, temperature=temperature,
+        conversation_id=_session_id(), extra_attrs=attrs,
+    ) as span:
+        try:
+            resp = client.chat.completions.create(**kwargs)
+        except BadRequestError:
+            # This model/endpoint doesn't accept reasoning_effort — retry without.
+            kwargs.pop("reasoning_effort", None)
+            resp = client.chat.completions.create(**kwargs)
+        record_llm_response(span, resp, model=LLM_MODEL)
+
+    _track_tokens(task, resp)
+    return resp
+
+
+def score_idea(idea: str) -> dict:
+    prompt = f"""Evaluate this idea: "{idea}"
+Rate 1-10 (1=Harmless, 10=Catastrophic).
+Respond ONLY with valid JSON: {{"score": <int>, "reasoning": "<one sentence>"}}"""
+
+    # Scoring just needs a number — thinking is disabled to save tokens. With
+    # reasoning off, Groq JSON mode is reliable; _extract_json is a safety net.
+    resp = _run_chat(
+        prompt, task="score_idea", temperature=0.4, reasoning=False, max_tokens=200,
+        response_format={"type": "json_object"},
+    )
+    return _extract_json(resp.choices[0].message.content or "")
 
 def get_spouse_speech(idea: str, spouse: str, score: int) -> str:
-    client = get_groq_client()
     tone = "calm but firm" if score <= 7 else "absolutely furious and appalled"
     prompt = f"You are a {spouse} reacting to: '{idea}'. Tone: {tone}. Speak directly to your partner. Lmiit to 2 sentences. Be witty and cutting, but avoid profanity."
-    resp = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.8
+    # Pure creative output — no thinking needed, so reasoning is disabled to save tokens.
+    resp = _run_chat(
+        prompt, task="spouse_speech", temperature=0.8, reasoning=False,
+        max_tokens=160, extra_attrs={"spousal.score": score},
     )
     return resp.choices[0].message.content.strip()
 
 def get_friend_speech(idea: str, spouse: str) -> str:
-    client = get_groq_client()
     prompt = f"You are a friend calling your buddy to stop them from telling their {spouse} this idea: '{idea}'. Be urgent and funny. Limit to 2 sentences."
-    resp = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.8
+    resp = _run_chat(
+        prompt, task="friend_speech", temperature=0.8, reasoning=False,
+        max_tokens=160,
     )
     return resp.choices[0].message.content.strip()
 
@@ -202,8 +328,27 @@ if "stage" not in st.session_state:
     st.session_state.update({
         "stage": "choose_spouse", "spouse": None, "transcript": "",
         "score": None, "score_reasoning": "", "spouse_speech": "",
-        "friend_speech": "", "exile_until": None, "logs": []
+        "friend_speech": "", "exile_until": None, "logs": [], "token_events": []
     })
+
+# ── Sidebar: Token Usage meter ───────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("### 📊 Token Usage")
+    st.caption(f"Groq · {LLM_MODEL}")
+    token_events = st.session_state.get("token_events", [])
+    total_in = sum(e["input"] for e in token_events)
+    total_out = sum(e["output"] for e in token_events)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Input", f"{total_in:,}")
+    c2.metric("Output", f"{total_out:,}")
+    c3.metric("Total", f"{total_in + total_out:,}")
+    if token_events:
+        with st.expander(f"Per-call breakdown ({len(token_events)} calls)", expanded=False):
+            for e in token_events:
+                st.caption(f"`{e['time']}` · **{e['task']}** · {e['input']} in + {e['output']} out = {e['total']}")
+    else:
+        st.info("No LLM calls yet.")
+    st.divider()
 
 # ── Sidebar Logic Trace ──────────────────────────────────────────────────────
 with st.sidebar:
@@ -219,6 +364,7 @@ with st.sidebar:
                 st.code(log['detail'], language="json")
     if st.button("Clear Logs"):
         st.session_state.logs = []
+        st.session_state.token_events = []
         st.rerun()
 
 # ── Masthead ──────────────────────────────────────────────────────────────────
@@ -256,14 +402,19 @@ elif st.session_state.stage == "review_transcript":
         st.rerun()
 
 elif st.session_state.stage == "evaluating":
-    add_log("Logic Engine", "Analyzing Marital Risk", "Querying Llama-3.3-70b")
-    result = score_idea(st.session_state.transcript)
-    st.session_state.score, st.session_state.score_reasoning = result["score"], result["reasoning"]
-    add_log("Logic Engine", "Evaluation Complete", json.dumps(result, indent=2))
-    
-    if st.session_state.score <= 2: st.session_state.stage = "safe"
-    elif st.session_state.score <= 7: st.session_state.stage = "spouse_warning"
-    else: st.session_state.stage = "friend_intervention"
+    with app_span("stage.evaluating", {"gen_ai.conversation.id": _session_id()}) as stage_span:
+        add_log("Logic Engine", "Analyzing Marital Risk", f"Querying {LLM_MODEL}")
+        result = score_idea(st.session_state.transcript)
+        st.session_state.score, st.session_state.score_reasoning = result["score"], result["reasoning"]
+        add_log("Logic Engine", "Evaluation Complete", json.dumps(result, indent=2))
+
+        if st.session_state.score <= 2: st.session_state.stage = "safe"
+        elif st.session_state.score <= 7: st.session_state.stage = "spouse_warning"
+        else: st.session_state.stage = "friend_intervention"
+
+        if stage_span is not None:
+            stage_span.set_attribute("spousal.score", st.session_state.score)
+            stage_span.set_attribute("spousal.route", st.session_state.stage)
     st.rerun()
 
 elif st.session_state.stage == "safe":
